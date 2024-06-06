@@ -1,20 +1,22 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:simple_logger/simple_logger.dart';
-import 'communication_handler.dart';
+import 'package:geolocator/geolocator.dart';
 
 
-double originLng =80.558137;
-double originLat = 7.1654932;
+
+List<int> byteInput = [0,2];
+ double originLng = 0.0;
+  double originLat = 0.0 ;
 double desLat =7.175489;
 double desLng = 80.558137;
 double distance = 0;
 String dis = "";
-String deviceId = "";
+
 Set<Polyline> _polylines = {};
 class MapPage extends StatefulWidget {
   const MapPage({super.key});
@@ -24,14 +26,25 @@ class MapPage extends StatefulWidget {
 }
 
 class _MapPageState extends State<MapPage> {
+  
+  //bluetooth
+  final _ble = FlutterReactiveBle();
+  late int preByte;
+  StreamSubscription<DiscoveredDevice>? _scanSub;
+  StreamSubscription<ConnectionStateUpdate>? _connectSub;
+  StreamSubscription<List<int>>? _notifySub;
+  List<int> completeMessage = [];
+  var _found = false;
+  var _value = '';
 
-  SimpleLogger logger = SimpleLogger();
-  CommunicationHandler? communicationHandler;
-  bool isScanStarted = false;
-  bool isConnected = false;
-  List<DiscoveredDevice> discoveredDevices = List<DiscoveredDevice>.empty(growable: true);
-  String connectedDeviceDetails = "";
-  final flutterReactiveBle = FlutterReactiveBle();
+  
+  //google map
+  BitmapDescriptor? customIcon;
+  late Position _currentPosition;
+  String? _currentAddress;
+ // Position? _currentPosition;
+  bool _isLoading = true;
+  bool destinationMrk = false;
   late GoogleMapController _mapController ;
   TextEditingController originController = TextEditingController();
   TextEditingController destController = TextEditingController();
@@ -39,57 +52,38 @@ class _MapPageState extends State<MapPage> {
    @override
   void initState() {
      check();
+     _loadCustomIcon();
+     _getCurrentLocation();
+
     // TODO: implement initState
     super.initState();
   }
 
-  void startScan() {
-    setState(() {
-      isScanStarted = true;
-      discoveredDevices.clear();
-    });
-    communicationHandler ??= CommunicationHandler();
-    communicationHandler?.startScan((scanDevice) {
-      logger.info("Scan device: ${scanDevice.name}");
-     // var device = discoveredDevices.firstWhere((val) => val.id == scanDevice.id, );
-      if (!discoveredDevices.any((val) => val.id == scanDevice.id) ) {
-        logger.info("Added new device to list: ${scanDevice.name}");
-        setState(() {
-          discoveredDevices.add(scanDevice);
-        });
-      }else{
-        logger.info("discoveredDevices.first");
-
-        // setState(() {
-        //   discoveredDevices.add(scanDevice);
-        // });
-      }
-    });
-
-
+  void _loadCustomIcon() async {
+    // Load the arrow icon image from assets
+    customIcon = await BitmapDescriptor.fromAssetImage(
+      const ImageConfiguration(size: Size(28, 28)), // Adjust the size as needed
+      'images/arrowS.png', // Replace 'arrow_icon.png' with your actual image file
+    );
   }
 
-  Future<void> stopScan() async {
-    await communicationHandler?.stopScan();
+  _getCurrentLocation() async {
+    Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high);
     setState(() {
-      isScanStarted = false;
-    });
-  }
-
-  Future<void> connectToDevice(DiscoveredDevice selectedDevice) async {
-    await stopScan();
-    communicationHandler?.connectToDevice(selectedDevice, (isConnected) {
-      this.isConnected = isConnected;
-      if (isConnected) {
-        logger.info("connected to $selectedDevice");
-        connectedDeviceDetails = "Connected Device Details\n\n$selectedDevice";
-      } else {
-        logger.info("not connected");
-        connectedDeviceDetails = "";
-      }
+      _currentPosition = position;
+      print(_currentPosition.latitude);
       setState(() {
-        connectedDeviceDetails;
+        originLat = _currentPosition.latitude;
+        originLng = _currentPosition.longitude;
+        desLat = _currentPosition.latitude;
+        desLng = _currentPosition.longitude;
+        originController.text = "$originLat,$originLng";
+        destController.text = "$desLat,$desLng";
+        _isLoading = false;
       });
+
+
     });
   }
 
@@ -97,15 +91,193 @@ class _MapPageState extends State<MapPage> {
   @override
   void dispose() {
     // TODO: implement dispose
+    _notifySub?.cancel();
+    _connectSub?.cancel();
+    _scanSub?.cancel();
     _mapController.dispose();
     super.dispose();
   }
 
 
 
+//bluetooth functions
+  void _onScanUpdate(DiscoveredDevice d) {
+    if (d.name == 'Falcon Tracker' ) {
+      print(d.id);
+      _found = true;
+      _connectSub = _ble.connectToDevice(id: d.id).listen((update) {
+        if (update.connectionState == DeviceConnectionState.connected) {
+          print("connected");
+          _onConnected(d.id);
+        }
+      });
+
+    }
+
+  }
+
+  void _onConnected(String deviceId) {
+    final characteristic = QualifiedCharacteristic(
+        deviceId: deviceId,
+        serviceId: Uuid.parse('0000181c-0000-1000-8000-00805f9b34fb'),
+        characteristicId: Uuid.parse('00002a38-0000-1000-8000-00805f9b34fb'));
+
+
+    _notifySub = _ble.subscribeToCharacteristic(characteristic).listen((bytes) {
+      setState(() {
+
+
+        // Add the received bytes to the completeMessage list
+        if (byteInput != null && byteInput!.toString() != bytes.toString()) {
+          completeMessage.addAll(bytes);
+          byteInput = bytes;
+          print("completeMessage$completeMessage");
+          if (completeMessage.contains(36)) { // Check for the end marker '$'
+
+            // Convert the list of bytes to a string using UTF-8 encoding
+            final asciiDecoder = AsciiDecoder();
+            final result = asciiDecoder.convert(completeMessage);
+            print("result:$result");
+            // Split the message using the delimiter '%'
+            final message = result.split('%');
+
+            // Check if the message has the expected number of components
+            if (message.length >= 3) {
+              // Extract individual components
+              final deviceId = message[0].trim();
+              final packetId = message[1].trim();
+              final longitude = message[2].trim();
+              var latitude = message[3].trim();
+              if (latitude != null && latitude.length > 0) {
+                latitude = latitude.substring(0, 9);
+              }
+              //String Lat = Latitude;
+
+              // Print or use the extracted values
+              print("Device ID: $deviceId");
+              print("Packet ID: $packetId");
+              print("Longitude: $longitude");
+              print("Latitude: $latitude");
+
+
+              originController.text = originController.text;
+              destController.text = "$longitude,$latitude";
+              getCoordinates(originController.text, destController.text);
+              // Clear the completeMessage list to prepare for the next message
+              completeMessage.clear();
+            } else {
+              // Invalid message format
+              print("Invalid message format");
+              // Clear the completeMessage list to discard the current incomplete message
+              completeMessage.clear();
+            }
+          }
+        }
+
+        // Process the complete message if it's received in full
+
+      });
+    });
+    // setState(() {
+    //   print("value is: $bytes");
+    //   // Check if the current bytes are different from the previous ones
+    //   if (byteInput != null && byteInput!.toString() != bytes.toString()) {
+    //     // Convert bytes to string using UTF-8 encoding
+    //     final asciiDecoder = AsciiDecoder();
+    //     final result = asciiDecoder.convert(bytes);
+    //
+    //     print("value is: $bytes");
+    //     // Split the message using the delimiter ', '
+    //     final message = result.split('%');
+    //
+    //     // Check if the message has the expected number of components
+    //     if (message.length == 4) {
+    //       // Extract individual components
+    //       final deviceId = message[0].trim();
+    //       final packetId = message[1].trim();
+    //       final longitude = message[2].trim();
+    //       final latitude = message[3];
+    //
+    //       // Print or use the extracted values
+    //       print(bytes);
+    //       print(_value);
+    //       print("Device ID: $deviceId");
+    //       print("Packet ID: $packetId");
+    //       print("Longitude: $longitude");
+    //       print("Latitude: $latitude");
+    //
+    //       // Update the previous bytes to the current ones
+    //       byteInput = bytes;
+    //     } else {
+    //
+    //     }
+    //   } else if (byteInput == null) {
+    //     // Convert bytes to string using UTF-8 encoding if this is the first message
+    //     final asciiDecoder = AsciiDecoder();
+    //     final result = asciiDecoder.convert(bytes);
+    //
+    //
+    //     // Split the message using the delimiter ', '
+    //     final message = result.split(', ');
+    //
+    //     // Check if the message has the expected number of components
+    //     if (message.length == 5) {
+    //       // Extract individual components
+    //       final deviceId = message[0].trim();
+    //       final packetId = message[1].trim();
+    //       final longitude = message[2].trim();
+    //       final latitude = message[3].trim();
+    //
+    //       // Print or use the extracted values
+    //       print("Device ID: $deviceId");
+    //       print("Packet ID: $packetId");
+    //       print("Longitude: $longitude");
+    //       print("Latitude: $latitude");
+    //
+    //       // Update the previous bytes to the current ones
+    //       byteInput = bytes;
+    //     } else {
+    //
+    //     }
+    //   }
+    // });
+    // _notifySub = _ble.subscribeToCharacteristic(characteristic).listen((bytes) {
+    //   setState(() {
+    //     // Convert bytes to string using UTF-8 encoding
+    //     final asciiDecoder = AsciiDecoder();
+    //     final result = asciiDecoder.convert(bytes);
+    //
+    //     // Check if the current bytes are different from the previous ones
+    //     if (byteInput != null && byteInput!.toString() != bytes.toString()) {
+    //       final message = result.split(",");
+    //       print(message.length);
+    //
+    //       print("prebyte: $byteInput");
+    //       print("current byte: $bytes");
+    //       print("ssssssss");
+    //       print("result: $result");
+    //       print("ssssssss");
+    //
+    //       // Update the previous bytes to the current ones
+    //       byteInput = bytes;
+    //     } else if (byteInput == null) {
+    //       print("prebyte is null");
+    //       print("current byte: $bytes");
+    //       print("ssssssss");
+    //       print("result: $result");
+    //       print("ssssssss");
+    //
+    //       byteInput = bytes;
+    //     }
+    //   });
+    // });
+
+
+  }
+
   Future<void> check() async {
 
-    Map<Permission, PermissionStatus> statuses = await [
+    Map<Permission, PermissionStatus> status = await [
       Permission.bluetooth,
       Permission.bluetoothConnect,
       Permission.bluetoothScan,
@@ -113,7 +285,7 @@ class _MapPageState extends State<MapPage> {
       Permission.bluetoothAdvertise,
     ].request();
 
-    logger.info("PermissionStatus -- $statuses");
+
 
     if(await Permission.location.serviceStatus.isEnabled){
       print("enabled");
@@ -143,6 +315,9 @@ class _MapPageState extends State<MapPage> {
   }
   @override
   Widget build(BuildContext context) {
+    if (customIcon == null) {
+       // Placeholder while loading
+    }
      final origin = LatLng(originLat,originLng );
      final destination = LatLng(desLat,desLng);
 
@@ -179,8 +354,7 @@ class _MapPageState extends State<MapPage> {
       body:
            Stack(
              children: [
-
-
+               _isLoading == true ? Center(child: CircularProgressIndicator()):
                GoogleMap(
                  zoomControlsEnabled: false,
                 mapType: MapType.normal,
@@ -193,20 +367,23 @@ class _MapPageState extends State<MapPage> {
                      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
                      position: origin,
                    ),
+
                    Marker(
                      markerId: MarkerId("destination"),
-                     icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue),
+                     icon: customIcon!,
                      position: destination,
 
                    ),
                  },
+
                  polylines: {
+
                    Polyline(
                      polylineId: PolylineId("path"),
                      points: latlng,
                      color: Colors.black,
                      width: 3,
-                   )
+                   ),
 
 
 
@@ -253,10 +430,10 @@ class _MapPageState extends State<MapPage> {
 
                              child: IconButton(onPressed: (){
                                setState(() {
-                                  originLng =80.558137;
-                                  originLat = 7.1654932;
-                                  desLat =7.175489;
-                                  desLng = 80.558137;
+                                  originLng =originLng;
+                                  originLat = originLat;
+                                  desLat =desLat;
+                                  desLng = desLng;
                                   originController.text = "$originLat,$originLng";
                                   destController.text = "$desLat,$desLng";
                                   calculateDistance(originLng, originLat, desLat, desLng);
@@ -352,83 +529,34 @@ class _MapPageState extends State<MapPage> {
                      ),
 
                    )),//AppBar
-               Positioned(
-                 top: height*0.25,
-                   left: width*0.235,
-                   child:  Container(
-                     width: width*0.6,
-                     height: height*0.6,
-                     color: Colors.redAccent,
-                     child: Column(
-                       children: [
-                         Center(
-                           child: TextButton(
-                             onPressed: () {
-                               isScanStarted ? stopScan() : startScan();
-                             },
-                             child: Text(isScanStarted ? "Stop Scan" : "Start Scan",style: TextStyle(color: Colors.white),),
-                           ),
-                         ),
-                         SizedBox(
 
-                           height: height*0.5,
-                           width: width*0.6,
-                           child: ListView.builder(
-                               padding: const EdgeInsets.all(3),
-                               itemCount: discoveredDevices.length,
-                               itemBuilder: (BuildContext context, int index) {
-                                 return Padding(
-                                   padding: const EdgeInsets.all(5),
-                                   child: Container(
-                                     height: 60,
-                                     width: 60,
-                                     color: Colors.greenAccent,
-                                     child: Center(
-                                         child: TextButton(
-                                           child: Text(discoveredDevices[index].name),
-                                           onPressed: () {
-                                             logger.info(discoveredDevices[index].name+ "fuck");
-                                             DiscoveredDevice selectedDevice = discoveredDevices[index];
-                                             connectToDevice(selectedDevice);
-                                           },
-                                         )),
-                                   ),
-                                 );
-                               }),
-                         ),
-
-                       ],
-                     ),
-                   ),
-
-                   // FloatingActionButton(
-                   //   onPressed: (){
-                   //    startScan();
-                   //     setState(() {
-                   //
-                   //       // flutterReactiveBle.scanForDevices(withServices: [], scanMode: ScanMode.lowLatency).listen((device) {
-                   //       //   //save the device id to a variable
-                   //       //   deviceId = device.id;
-                   //       //   print(deviceId);
-                   //       // });
-                   //     });
-                   //
-                   //
-                   //
-                   //   },
-                   //   backgroundColor: Colors.blueGrey,
-                   //   child: Icon(Icons.bluetooth_disabled,color: Colors.white70,),
-                   // ),
-               ),//bluetooth
                Positioned(
                  top: height*0.18,
                  left: width*0.67,
                  child: FloatingActionButton(
-                   onPressed: (){},
+                   key: Key("get_data"),
+                   onPressed: () async{
+                    _getCurrentLocation();
+                   },
                    backgroundColor: Colors.blue,
                    child: Icon(Icons.download,color: Colors.white70,),
                  ),
                ),
+
+               Positioned(
+                 top: height*0.18,
+                 left: width*0.83,
+                 child: FloatingActionButton(
+                   key: Key("bluetooth"),
+                   onPressed: () async{
+                     _scanSub = _ble.scanForDevices(withServices: []).listen(_onScanUpdate);
+                   },
+                   backgroundColor: _found==true? Colors.green:Colors.blue,
+                   child: _found==true? Icon(Icons.bluetooth,color: Colors.white70,):Icon(Icons.bluetooth_disabled,color: Colors.white,),
+                 ),
+               ),
+
+
                Positioned(
                  top: height*0.18,
                    left: width*0.02,
@@ -448,6 +576,7 @@ class _MapPageState extends State<MapPage> {
                  top: height*0.87,
                  left: width*0.842,
                  child: FloatingActionButton(
+                   key: Key("dest"),
                    onPressed: (){
                      _mapController.animateCamera(CameraUpdate.newCameraPosition(dest));
                    },
@@ -459,6 +588,7 @@ class _MapPageState extends State<MapPage> {
              ],
            ),
       floatingActionButton: FloatingActionButton(
+        key: Key("origin_"),
           onPressed: ()=>_mapController.animateCamera(CameraUpdate.newCameraPosition(home)),
         backgroundColor: Colors.blue,
         mini: true,
